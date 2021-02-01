@@ -7,11 +7,11 @@ use std::path::PathBuf;
 
 use http::StatusCode;
 use hyper::body::{Body, Buf};
-use hyperlocal::{UnixClientExt, Uri, UnixConnector};
+use hyperlocal::{UnixClientExt, UnixConnector, Uri};
 use thiserror::Error;
 
-pub use self::model::{BootSource, InstanceInfo, Drive, RateLimiter, TokenBucket, ActionType};
 use self::model::InstanceActionInfo;
+pub use self::model::{ActionType, BootSource, Drive, InstanceInfo, RateLimiter, TokenBucket};
 
 pub struct Client {
     socket_path: PathBuf,
@@ -30,14 +30,10 @@ pub enum Error {
     UnexpectedResponse(String),
 
     #[error("client error: {fault_message}")]
-    Client {
-        fault_message: String,
-    },
+    Client { fault_message: String },
 
     #[error("server error: {fault_message}")]
-    Server {
-        fault_message: String,
-    }
+    Server { fault_message: String },
 }
 
 impl Client {
@@ -45,13 +41,14 @@ impl Client {
         let inner = hyper::Client::unix();
         Client {
             socket_path: socket_path.into(),
-            inner
+            inner,
         }
     }
 
     /// Returns general information about an instance.
     pub async fn instance_info(&self) -> Result<InstanceInfo, Error> {
-        let request = self.builder_for("/")
+        let request = self
+            .builder_for("/")
             .method("GET")
             .body(Body::default())
             .expect("malformed request");
@@ -63,11 +60,11 @@ impl Client {
         }
     }
 
-
     /// Creates new boot source if one does not already exist, otherwise updates it.
     /// Will fail if update is not possible. Pre-boot only.
     pub async fn set_boot_source(&self, source: &BootSource) -> Result<(), Error> {
-        let request = self.builder_for("/boot-source")
+        let request = self
+            .builder_for("/boot-source")
             .method("PUT")
             .body(serialize_json(source))
             .expect("malformed request");
@@ -84,7 +81,8 @@ impl Client {
     /// Will fail if update is not possible.
     pub async fn set_drive(&self, drive: &Drive) -> Result<(), Error> {
         // TODO: can the drive ID in the URL ever be different from the drive ID in the body?
-        let request = self.builder_for(&format!("/drives/{}", drive.drive_id))
+        let request = self
+            .builder_for(&format!("/drives/{}", drive.drive_id))
             .method("PUT")
             .body(serialize_json(drive))
             .expect("malformed request");
@@ -98,9 +96,12 @@ impl Client {
 
     /// Creates a synchronous (to the VMM) action.
     pub async fn action(&self, action: ActionType) -> Result<(), Error> {
-        let request = self.builder_for("/actions")
+        let request = self
+            .builder_for("/actions")
             .method("PUT")
-            .body(serialize_json(&InstanceActionInfo { action_type: action }))
+            .body(serialize_json(&InstanceActionInfo {
+                action_type: action,
+            }))
             .expect("malformed request");
         let response = self.inner.request(request).await?;
         if response.status() == StatusCode::NO_CONTENT {
@@ -120,13 +121,13 @@ impl Client {
 
 /// Serialize a value to a JSON body
 fn serialize_json<S: serde::Serialize>(body: &S) -> Body {
-    serde_json::to_vec(body)
-        .expect("malformed body")
-        .into()
+    serde_json::to_vec(body).expect("malformed body").into()
 }
 
 /// Deserializes the HTTP response body as JSON
-async fn deserialize_json<D: serde::de::DeserializeOwned>(response: hyper::Response<Body>) -> Result<D, Error> {
+async fn deserialize_json<D: serde::de::DeserializeOwned>(
+    response: hyper::Response<Body>,
+) -> Result<D, Error> {
     let body = hyper::body::aggregate(response).await?;
     Ok(serde_json::from_reader(body.reader())?)
 }
@@ -135,17 +136,20 @@ async fn deserialize_error(response: hyper::Response<Body>) -> Error {
     let status = response.status();
     let error: model::Error = match deserialize_json(response).await {
         Ok(err) => err,
-        Err(err) => return err
+        Err(err) => return err,
     };
     if status.is_client_error() {
-        Error::Client { fault_message: error.fault_message }
+        Error::Client {
+            fault_message: error.fault_message,
+        }
     } else if status.is_server_error() {
-        Error::Server { fault_message: error.fault_message }
+        Error::Server {
+            fault_message: error.fault_message,
+        }
     } else {
         Error::UnexpectedResponse(format!("Got {} from server, expected an error", status))
     }
 }
-
 
 /// Firecracker API model types, from the [spec](https://github.com/firecracker-microvm/firecracker/blob/master/src/api_server/swagger/firecracker.yaml).
 mod model {
@@ -256,5 +260,5 @@ mod model {
 
         /// The total number of tokens this bucket can hold.
         pub size: u64,
-    }   
+    }
 }

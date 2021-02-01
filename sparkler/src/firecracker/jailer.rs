@@ -1,7 +1,11 @@
-use std::{collections::HashMap, ffi::OsString, path::{Path, PathBuf}};
+use std::{
+    collections::HashMap,
+    ffi::OsString,
+    path::{Path, PathBuf},
+};
 
 use nix::unistd::{Gid, Uid};
-use unshare::{Command, Child, Namespace};
+use unshare::{Child, Command, Namespace};
 
 use crate::Error;
 
@@ -73,9 +77,11 @@ impl<'a> Config<'a> {
     /// This takes the form `$chroot_base/$(basename $firecracker_binary)/$id`.
     pub fn chroot_path(&self) -> PathBuf {
         let mut path = self.chroot_base.to_path_buf();
-        path.push(self.firecracker_binary
-            .file_name()
-            .expect("no file name for Firecracker binary"));
+        path.push(
+            self.firecracker_binary
+                .file_name()
+                .expect("no file name for Firecracker binary"),
+        );
         path.push(self.id);
         path.push("root");
         path
@@ -86,7 +92,7 @@ fn build_command(config: &Config<'_>) -> Command {
     // Use `unshare` for starting the jailer, since it handles the nuances of safely `clone()`ing from Rust. The alternative would be doing the
     // clone(CLONE_NEWPID) -> exec dance ourselves, while making sure not to accidentally deadlock or break things.
     let mut command = Command::new(config.jailer_binary);
-    
+
     command.arg("--id").arg(config.id);
     command.arg("--exec-file").arg(config.firecracker_binary);
     command.arg("--uid").arg(config.user.to_string());
@@ -96,7 +102,7 @@ fn build_command(config: &Config<'_>) -> Command {
     for (file, value) in config.cgroup.iter() {
         command.arg("--cgroup").arg(format!("{}={}", file, value));
     }
-    
+
     if let Some(netns) = config.network_namespace {
         command.arg("--netns").arg(netns);
     }
@@ -112,7 +118,5 @@ fn build_command(config: &Config<'_>) -> Command {
 }
 
 pub fn spawn(config: &Config<'_>) -> Result<Child, Error> {
-    build_command(config)
-        .spawn()
-        .map_err(Error::Jailer)
+    build_command(config).spawn().map_err(Error::Jailer)
 }

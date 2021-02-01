@@ -1,5 +1,6 @@
-use std::{env, fs, time::Duration};
 use std::path::PathBuf;
+use std::sync::{Arc, Mutex};
+use std::{fs, time::Duration};
 
 use nix::unistd::{Gid, Uid};
 use tokio::task::spawn_blocking;
@@ -28,7 +29,7 @@ async fn main() {
         Err(error) => die(&error),
     };
 
-    if let Err(error) = run(&state).await {
+    if let Err(error) = run(state.clone()).await {
         error!("run() failed: {}", error);
         if let Err(cleanup_err) = spawn_blocking(|| cleanup_vm(state)).await.unwrap() {
             error!("Cleanup failed: {}", cleanup_err);
@@ -57,7 +58,7 @@ struct VmState {
 }
 
 #[tracing::instrument]
-fn setup_vm() -> Result<VmState, Error> {
+fn setup_vm() -> Result<Arc<Mutex<VmState>>, Error> {
     let network_namespace = network::namespace::create(NETWORK_NAMESPACE)?;
 
     let jailer_config = ConfigBuilder::default()
@@ -79,28 +80,18 @@ fn setup_vm() -> Result<VmState, Error> {
     info!("Starting Firecracker");
     let process = jailer::spawn(&jailer_config)?;
 
-    Ok(VmState {
+    Ok(Arc::new(Mutex::new(VmState {
         process,
         chroot_path: jailer_config.chroot_path(),
-    })
+    })))
 }
 
 #[tracing::instrument]
-fn cleanup_vm(mut state: VmState) -> Result<(), Error> {
+fn cleanup_vm(state: Arc<Mutex<VmState>>) -> Result<(), Error> {
     use nix::mount::{umount2, MntFlags};
 
     info!("Cleaning up VMM");
-
-    state.process.signal(unshare::Signal::SIGKILL)
-        .map_err(|error| Error::Io {
-            context: format!("could not kill jailer process {}", state.process.pid()),
-            error
-        })?;
-    let exit_status = state.process.wait().map_err(|error| Error::Io {
-        context: format!("waiting for jailer process {} failed", state.process.pid()),
-        error,
-    })?;
-    info!("Jailer exited with status {}", exit_status);
+    let state = state.lock().unwrap();
 
     network::namespace::delete(NETWORK_NAMESPACE)?;
 
@@ -120,8 +111,11 @@ fn cleanup_vm(mut state: VmState) -> Result<(), Error> {
     Ok(())
 }
 
-async fn run(state: &VmState) -> Result<(), Error> {
-    let socket_path = state.chroot_path.join("run").join("firecracker.socket");
+async fn run(state: Arc<Mutex<VmState>>) -> Result<(), Error> {
+    let socket_path = {
+        let state = state.lock().unwrap();
+        state.chroot_path.join("run").join("firecracker.socket")
+    };
 
     let mut exists = false;
     for _ in 0u8..10 {
@@ -135,8 +129,8 @@ async fn run(state: &VmState) -> Result<(), Error> {
 
     if !exists {
         return Err(Error::Api(firecracker::api::Error::Server {
-            fault_message: "timed out waiting for socket to exist".into()
-        }))
+            fault_message: "timed out waiting for socket to exist".into(),
+        }));
     }
 
     info!(
@@ -146,25 +140,40 @@ async fn run(state: &VmState) -> Result<(), Error> {
 
     let client = Client::new(socket_path);
 
-    // client.set_boot_source(&BootSource {
-    //     kernel_image_path: "image/hello-vmlinux.bin".into(),
-    //     initrd_path: None,
-    //     boot_args: Some("console=ttyS0 reboot=k panic=1 pci=off".into())
-    // }).await?;
+    client
+        .set_boot_source(&BootSource {
+            kernel_image_path: "image/hello-vmlinux.bin".into(),
+            initrd_path: None,
+            boot_args: Some("console=ttyS0 reboot=k panic=1 pci=off".into()),
+        })
+        .await?;
 
-    // client.set_drive(&Drive {
-    //     drive_id: "rootfs".into(),
-    //     is_read_only: false,
-    //     is_root_device: true,
-    //     path_on_host: "image/hello-rootfs.ext4".into(),
-    //     partuuid: None,
-    //     rate_limiter: None,
-    // }).await?;
+    client
+        .set_drive(&Drive {
+            drive_id: "rootfs".into(),
+            is_read_only: false,
+            is_root_device: true,
+            path_on_host: "image/hello-rootfs.ext4".into(),
+            partuuid: None,
+            rate_limiter: None,
+        })
+        .await?;
 
-    // client.action(ActionType::InstanceStart).await?;
+    client.action(ActionType::InstanceStart).await?;
 
     let info = client.instance_info().await?;
     info!("Instance info: {:?}", info);
+
+    let exit_status = spawn_blocking(move || {
+        let mut state = state.lock().unwrap();
+        state.process.wait().map_err(|error| Error::Io {
+            context: format!("waiting for jailer process {} failed", state.process.pid()),
+            error,
+        })
+    })
+    .await
+    .unwrap()?;
+    info!("Jailer complete: {}", exit_status);
 
     Ok(())
 }

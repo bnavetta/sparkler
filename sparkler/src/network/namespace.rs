@@ -1,24 +1,24 @@
 //! Utilities for dealing with Linux network namespaces
 
-use std::fs::{self, DirBuilder, OpenOptions, File};
-use std::os::unix::io::AsRawFd;
+use std::fs::{self, DirBuilder, File, OpenOptions};
 use std::os::unix::fs::{DirBuilderExt, OpenOptionsExt};
+use std::os::unix::io::AsRawFd;
 use std::path::PathBuf;
 
 use nix::{
     errno::Errno,
-    mount::{mount, MsFlags, umount2, MntFlags},
+    mount::{mount, umount2, MntFlags, MsFlags},
     sched,
     sys::stat::Mode,
 };
 
+use crate::util::{bind_mount, bind_mount_flags, FileLock};
 use crate::Error;
-use crate::util::{FileLock, bind_mount_flags, bind_mount};
 
 // This uses the same approach as
 // - https://git.kernel.org/pub/scm/network/iproute2/iproute2.git/tree/ip/ipnetns.c
 // - https://github.com/containernetworking/plugins/blob/master/pkg/testutils/netns_linux.go
-// 
+//
 // We save the current network namespace, create a new one with unshare(2), bind-mount it to a persistent path, and then restore the original namespace.
 // Using unshare(2) avoids the overhead of a clone(2), and the bind mount ensures that the namespace sticks around even with no processes using it.
 
@@ -44,29 +44,35 @@ pub fn create(name: &str) -> Result<PathBuf, Error> {
         .create_new(true)
         .open(&namespace_path)
         .map_err(|error| Error::Io {
-            context: format!("could not create network namespace file {}", namespace_path.display()),
-            error
+            context: format!(
+                "could not create network namespace file {}",
+                namespace_path.display()
+            ),
+            error,
         })?;
 
     // Step 2.0: Save our current network namespace
     let _guard = NamespaceGuard::from_current()?;
 
     // Step 2: Create a new network namespace
-    sched::unshare(sched::CloneFlags::CLONE_NEWNET)
-        .map_err(|error| Error::System {
-            context: "could not create a new network namespace".into(),
-            error
-        })?;
-    
+    sched::unshare(sched::CloneFlags::CLONE_NEWNET).map_err(|error| Error::System {
+        context: "could not create a new network namespace".into(),
+        error,
+    })?;
+
     // Step 2.5: Bind-mount it to a persistent path. We can use /proc/self/ns/net because we're currently in the new namespace
     if let Err(error) = bind_mount("/proc/self/ns/net", &namespace_path) {
         // If the bind mount failed, we should clean up by removing the namespace file we created
         if let Err(err) = fs::remove_file(&namespace_path) {
             // TODO: log instead
-            eprintln!("could not clean up namespace file {} on failed creation: {:?}", namespace_path.display(), err);
+            eprintln!(
+                "could not clean up namespace file {} on failed creation: {:?}",
+                namespace_path.display(),
+                err
+            );
         }
 
-        return Err(error)
+        return Err(error);
     }
 
     Ok(namespace_path)
@@ -77,11 +83,10 @@ pub fn delete(name: &str) -> Result<(), Error> {
     let path = persistent_namespace_path(name);
     // This will fail with EINVAL if the mount point has already been unbound
     let _ = umount2(&path, MntFlags::MNT_DETACH);
-    fs::remove_file(&path)
-        .map_err(|error| Error::Io {
-            context: format!("could not remove namespace file {}", path.display()),
-            error
-        })
+    fs::remove_file(&path).map_err(|error| Error::Io {
+        context: format!("could not remove namespace file {}", path.display()),
+        error,
+    })
 }
 
 /// Prepare the root runtime directory for persistent network namespaces.
@@ -128,21 +133,37 @@ fn prepare_runtime_directory() -> Result<(), Error> {
 
     // Step 3: Make the mountpoint shared, with recursive propagation
     fn set_propagation() -> Result<(), Error> {
-        mount(NONE, NETNS_RUNTIME_DIRECTORY, NONE, MsFlags::MS_SHARED | MsFlags::MS_REC, NONE)
-            .map_err(|error| Error::System {
-                context: format!("could not set mount propagation on {}", NETNS_RUNTIME_DIRECTORY),
-                error
-            })
+        mount(
+            NONE,
+            NETNS_RUNTIME_DIRECTORY,
+            NONE,
+            MsFlags::MS_SHARED | MsFlags::MS_REC,
+            NONE,
+        )
+        .map_err(|error| Error::System {
+            context: format!(
+                "could not set mount propagation on {}",
+                NETNS_RUNTIME_DIRECTORY
+            ),
+            error,
+        })
     }
 
     match set_propagation() {
-        Err(Error::System { error: nix::Error::Sys(Errno::EINVAL), ..}) => {
+        Err(Error::System {
+            error: nix::Error::Sys(Errno::EINVAL),
+            ..
+        }) => {
             // If set_propagation failed with EINVAL, assume we need to upgrade to a mountpoint
-            bind_mount_flags(NETNS_RUNTIME_DIRECTORY, NETNS_RUNTIME_DIRECTORY, MsFlags::MS_REC)?;
+            bind_mount_flags(
+                NETNS_RUNTIME_DIRECTORY,
+                NETNS_RUNTIME_DIRECTORY,
+                MsFlags::MS_REC,
+            )?;
             set_propagation()?;
-        },
+        }
         Err(err) => return Err(err),
-        Ok(()) => ()
+        Ok(()) => (),
     };
 
     Ok(())
@@ -160,13 +181,13 @@ impl NamespaceGuard {
     /// namespace with [`sched::unshare`].
     fn from_current() -> Result<NamespaceGuard, Error> {
         let saved_namespace = OpenOptions::new()
-        .read(true)
-        .custom_flags(nix::libc::O_CLOEXEC)
-        .open("/proc/self/ns/net")
-        .map_err(|error| Error::Io {
-            context: "could not open current network namespace".into(),
-            error
-        })?;
+            .read(true)
+            .custom_flags(nix::libc::O_CLOEXEC)
+            .open("/proc/self/ns/net")
+            .map_err(|error| Error::Io {
+                context: "could not open current network namespace".into(),
+                error,
+            })?;
         Ok(NamespaceGuard(saved_namespace))
     }
 }

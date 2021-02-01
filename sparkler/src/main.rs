@@ -1,5 +1,6 @@
-use std::error::Error as _;
+use std::{error::Error as _, path::PathBuf};
 use std::path::Path;
+use std::fs;
 
 use nix::unistd::{Uid, Gid};
 use tokio::task::spawn_blocking;
@@ -13,6 +14,8 @@ use error::Error;
 use firecracker::api::*;
 use firecracker::jailer::{self, ConfigBuilder};
 
+const NETWORK_NAMESPACE: &str = "test";
+
 #[tokio::main]
 async fn main() {
     if let Err(error) = run().await {
@@ -24,89 +27,90 @@ async fn main() {
     }
 }
 
-async fn run() -> Result<(), Box<dyn std::error::Error>> {
-    let network_namespace = spawn_blocking(|| {
-        network::namespace::create_network_namespace("test")
-    }).await??;
+struct VmState {
+    process: unshare::Child,
+    chroot_path: PathBuf,
+}
+
+fn setup_vm() -> Result<VmState, Error> {
+    let network_namespace = network::namespace::create(NETWORK_NAMESPACE)?;
 
     let jailer_config = ConfigBuilder::default()
-        .jailer_binary(Path::new("/usr/bin/jailer"))
-        .firecracker_binary(Path::new("/usr/bin/firecracker"))
-        .chroot_base(Path::new("/srv/jailer"))
         .user(Uid::current())
         .group(Gid::current())
-        .id("myvm")
+        .id("testvm")
         .network_namespace(network_namespace.as_path())
-        .build()?;
+        .build().unwrap();
 
     let image_path = jailer_config.chroot_path().join("image");
-    std::fs::create_dir_all(&image_path)?;
-    util::bind_mount("image", &image_path)?;
+    fs::create_dir_all(&image_path).map_err(|error| Error::Io {
+        context: format!("could not create image directory {}", image_path.display()),
+        error
+    })?;
+
+    util::bind_mount("./image", &image_path)?;
 
     println!("Starting Firecracker");
-    let mut jail_proc = jailer::spawn(&jailer_config)?;
+    let process = jailer::spawn(&jailer_config)?;
 
-    let socket_path = jailer_config.chroot_path().join("run").join("firecracker.sock");
+    Ok(VmState {
+        process,
+        chroot_path: jailer_config.chroot_path(),
+    })
+}
 
-    println!("Waiting for Firecracker to start ({})...", socket_path.display());
-    while !socket_path.exists() {
-        tokio::task::yield_now().await;
-    }
+fn cleanup_vm(state: VmState) -> Result<(), Error> {
+    use nix::mount::{umount2, MntFlags};
 
-    println!("Firecracker up!");
+    network::namespace::delete(NETWORK_NAMESPACE)?;
 
-    let client = Client::new(socket_path);
+    let images_dir = state.chroot_path.join("image");
+    umount2(&images_dir, MntFlags::MNT_DETACH)
+        .map_err(|error| Error::System {
+            context: format!("could not unmount image directory {}", images_dir.display()),
+            error,
+        })?;
 
-    client.set_boot_source(&BootSource {
-        kernel_image_path: "image/hello-vmlinux.bin".into(),
-        initrd_path: None,
-        boot_args: Some("console=ttyS0 reboot=k panic=1 pci=off".into())
-    }).await?;
-
-    client.set_drive(&Drive {
-        drive_id: "rootfs".into(),
-        is_read_only: false,
-        is_root_device: true,
-        path_on_host: "image/hello-rootfs.ext4".into(),
-        partuuid: None,
-        rate_limiter: None,
-    }).await?;
-
-    client.action(ActionType::InstanceStart).await?;
-
-    let info = client.instance_info().await?;
-    println!("Instance info: {:?}", info);
-
-    spawn_blocking(move || jail_proc.wait()).await??;
+    // The chroot is in the "root" subdirectory of the VM's state path.
+    let state_root = state.chroot_path.parent().unwrap();
+    fs::remove_dir_all(&state_root)
+        .map_err(|error| Error::Io {
+            context: format!("could not remove VM  state in {}", state_root.display()),
+            error
+        })?;
 
     Ok(())
 }
 
+async fn run() -> Result<(), Box<dyn std::error::Error>> {
+    let state = spawn_blocking(setup_vm).await??;
 
-async fn start_vm() -> Result<(), Error> {
-    let client = Client::new("test.sock");
+    // let socket_path = state.chroot_path.join("run").join("firecracker.sock");
 
-    println!("Starting VM...");
+    // let client = Client::new(socket_path);
 
-    client.set_boot_source(&BootSource {
-        kernel_image_path: "hello-vmlinux.bin".into(),
-        initrd_path: None,
-        boot_args: Some("console=ttyS0 reboot=k panic=1 pci=off".into()),
-    }).await?;
+    // client.set_boot_source(&BootSource {
+    //     kernel_image_path: "image/hello-vmlinux.bin".into(),
+    //     initrd_path: None,
+    //     boot_args: Some("console=ttyS0 reboot=k panic=1 pci=off".into())
+    // }).await?;
 
-    client.set_drive(&Drive {
-        drive_id: "rootfs".into(),
-        is_read_only: false,
-        is_root_device: true,
-        path_on_host: "hello-rootfs.ext4".into(),
-        partuuid: None,
-        rate_limiter: None,
-    }).await?;
+    // client.set_drive(&Drive {
+    //     drive_id: "rootfs".into(),
+    //     is_read_only: false,
+    //     is_root_device: true,
+    //     path_on_host: "image/hello-rootfs.ext4".into(),
+    //     partuuid: None,
+    //     rate_limiter: None,
+    // }).await?;
 
-    client.action(ActionType::InstanceStart).await?;
+    // client.action(ActionType::InstanceStart).await?;
 
-    let info = client.instance_info().await?;
-    println!("Instance info: {:?}", info);
+    // let info = client.instance_info().await?;
+    // println!("Instance info: {:?}", info);
+
+
+    spawn_blocking(|| cleanup_vm(state)).await??;
 
     Ok(())
 }

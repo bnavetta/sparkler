@@ -7,7 +7,7 @@ use std::path::PathBuf;
 
 use nix::{
     errno::Errno,
-    mount::{mount, MsFlags},
+    mount::{mount, MsFlags, umount2, MntFlags},
     sched,
     sys::stat::Mode,
 };
@@ -32,11 +32,11 @@ const NONE: Option<&'static [u8]> = None;
 // panics because we cannot meaningfully recover from being in the wrong network namespace.
 struct NamespaceGuard(File);
 
-pub fn create_network_namespace(name: &str) -> Result<PathBuf, Error> {
+/// Create a persistent network namespace named `name`.
+pub fn create(name: &str) -> Result<PathBuf, Error> {
     prepare_runtime_directory()?;
 
-    let mut namespace_path = PathBuf::from(NETNS_RUNTIME_DIRECTORY);
-    namespace_path.push(name);
+    let namespace_path = persistent_namespace_path(name);
 
     // Step 1: Create the file for the network namespace (so we later have a file to bind-mount to)
     OpenOptions::new()
@@ -70,6 +70,18 @@ pub fn create_network_namespace(name: &str) -> Result<PathBuf, Error> {
     }
 
     Ok(namespace_path)
+}
+
+/// Delete a network namespace.
+pub fn delete(name: &str) -> Result<(), Error> {
+    let path = persistent_namespace_path(name);
+    // This will fail with EINVAL if the mount point has already been unbound
+    let _ = umount2(&path, MntFlags::MNT_DETACH);
+    fs::remove_file(&path)
+        .map_err(|error| Error::Io {
+            context: format!("could not remove namespace file {}", path.display()),
+            error
+        })
 }
 
 /// Prepare the root runtime directory for persistent network namespaces.
@@ -134,6 +146,13 @@ fn prepare_runtime_directory() -> Result<(), Error> {
     };
 
     Ok(())
+}
+
+/// Gets the path that a persistent network namespace should be bound to.
+fn persistent_namespace_path(name: &str) -> PathBuf {
+    let mut path = PathBuf::from(NETNS_RUNTIME_DIRECTORY);
+    path.push(name);
+    path
 }
 
 impl NamespaceGuard {

@@ -17,9 +17,11 @@ const DEFAULT_CHROOT_BASE: &str = "/srv/jailer";
 #[derive(derive_builder::Builder)]
 pub struct Config<'a> {
     /// Path to the `jailer` executable
+    #[builder(default = "{ Path::new(DEFAULT_JAILER) }")]
     jailer_binary: &'a Path,
 
     /// Path to the `firecracker` executable
+    #[builder(default = "{ Path::new(DEFAULT_FIRECRACKER) }")]
     firecracker_binary: &'a Path,
 
     /// Unique microVM jail ID
@@ -32,6 +34,7 @@ pub struct Config<'a> {
     group: Gid,
 
     /// Base directory to create chroot jails under.
+    #[builder(default = "{ Path::new(DEFAULT_CHROOT_BASE) }")]
     chroot_base: &'a Path,
 
     /// Network namespace to join before running Firecracker
